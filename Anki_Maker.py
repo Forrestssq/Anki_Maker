@@ -1,6 +1,9 @@
 '''
 3.1新功能
 - 对于提取文件的生词的功能:增加了对txt,PDF,word的支持
+- 增加了"删除重复词条"的功能
+- 支持自定义Anki牌组的标签,方便分类管理
+- 完善了词典补齐的功能:当且仅当一个单词完全匹配到词典的时候,才会补齐这个单词,否则skip
 
 3.0新功能
 - 增加了一个全新的功能:自动提取一个md文件里面的生词(生词指的是,牛津3000词以外,高考英语3500以外,以及一些基础的词汇),然后制作为词条
@@ -39,7 +42,7 @@ import time
 from datetime import datetime
 import re
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 import genanki
 from plyer import notification
 import nltk
@@ -49,7 +52,8 @@ from nltk.corpus import wordnet
 import re
 import tkinter.scrolledtext as scrolledtext  # 添加这行导入
 import chardet  # 需要安装：pip install chardet
-
+from tkinter import messagebox, simpledialog  # ✅ 加上 simpledialog
+import os
 
 # optional genanki for apkg export
 try:
@@ -146,8 +150,8 @@ def get_wordnet_pos(word):
 def lemmatize_word(word, lemmatizer):
     return lemmatizer.lemmatize(word.lower(), get_wordnet_pos(word))
 
-# 处理 MD 文件的函数（修改为返回过滤后的单词列表，适应 Anki_Maker 的 UI）
 def process_md_file(md_file):
+    """处理 MD 文件，返回过滤后的单词列表（保持原文顺序）"""
     lemmatizer = WordNetLemmatizer()
     try:
         with open(md_file, "r", encoding="utf-8") as f:
@@ -157,21 +161,11 @@ def process_md_file(md_file):
 
     # 提取英文单词并词形还原
     words = re.findall(r"[a-zA-Z']+", text)
-    lemmatized = set(lemmatize_word(w, lemmatizer) for w in words)
+    lemmatized = [lemmatize_word(w, lemmatizer) for w in words]
 
-    # 读取停用词
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    oxford_file = os.path.join(script_dir, "stopwords.txt")
-    if not os.path.exists(oxford_file):
-        return None, f"找不到 stopwords.txt 文件\n路径：{oxford_file}"
+    # ✅ 调用统一的过滤函数（保持原文顺序 + 去重 + 过滤停用词）
+    return filter_stopwords(lemmatized)
 
-    with open(oxford_file, "r", encoding="utf-8") as f:
-        oxford_words = set(line.strip().lower() for line in f)
-
-    # 过滤停用词
-    extra_stopwords = {"ve", "ll", "d", "m", "re", "s", "t", "isn", "wouldn"}
-    filtered = sorted(lemmatized - oxford_words - extra_stopwords)
-    return filtered, None
 
 def detect_file_encoding(file_path):
     """检测文件编码格式"""
@@ -214,8 +208,9 @@ def process_txt_file(txt_file):
     
     # 提取英文单词并词形还原（后续逻辑不变）
     words = re.findall(r"[a-zA-Z']+", text)
-    lemmatized = set(lemmatize_word(w, lemmatizer) for w in words)
+    lemmatized = [lemmatize_word(w, lemmatizer) for w in words]
     return filter_stopwords(lemmatized)
+
 
 def process_pdf_file(pdf_file):
     """处理PDF文件并返回过滤后的单词列表（增强版）"""
@@ -255,9 +250,7 @@ def process_pdf_file(pdf_file):
     
     # 提取英文单词并词形还原
     words = re.findall(r"[a-zA-Z']+", text)
-    lemmatized = set(lemmatize_word(w, lemmatizer) for w in words)
-    
-    # 过滤停用词
+    lemmatized = [lemmatize_word(w, lemmatizer) for w in words]
     return filter_stopwords(lemmatized)
 
 # 辅助提取函数
@@ -330,25 +323,38 @@ def process_word_file(word_file):
     
     # 后续处理逻辑不变
     words = re.findall(r"[a-zA-Z']+", text)
-    lemmatized = set(lemmatize_word(w, lemmatizer) for w in words)
+    lemmatized = [lemmatize_word(w, lemmatizer) for w in words]
     return filter_stopwords(lemmatized)
 
 
-def filter_stopwords(word_set):
-    """过滤停用词并返回处理结果"""
+
+def filter_stopwords(word_list):
+    """过滤停用词，并保持原文顺序去重"""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     oxford_file = os.path.join(script_dir, "stopwords.txt")
-    
+
     if not os.path.exists(oxford_file):
         return None, f"找不到 stopwords.txt 文件\n路径：{oxford_file}"
-    
+
     with open(oxford_file, "r", encoding="utf-8") as f:
         oxford_words = set(line.strip().lower() for line in f)
-    
-    # 过滤停用词
+
     extra_stopwords = {"ve", "ll", "d", "m", "re", "s", "t", "isn", "wouldn"}
-    filtered = sorted(word_set - oxford_words - extra_stopwords)
+
+    # ✅ 有序去重：保持原文顺序，只保留第一次出现的词
+    seen = set()
+    filtered = []
+    for w in word_list:
+        lw = w.lower()
+        if lw in seen:
+            continue
+        if lw in oxford_words or lw in extra_stopwords:
+            continue
+        seen.add(lw)
+        filtered.append(lw)
+
     return filtered, None
+
 
 
 def detect_pos_from_defs(defs):
@@ -522,22 +528,24 @@ class DictLookup:
             self.data = {}
 
     def lookup(self, word):
+        """仅当完全匹配时返回结果（一个字不多一个字不少）"""
         if not word:
             return None
 
         key = word.strip().lower()
+
+        # ✅ 只在 JSON 中完全匹配
         if key in self.data:
             return self._to_result(key, self.data[key])
 
-        alt = key.strip("'\"")
-        if alt in self.data:
-            return self._to_result(alt, self.data[alt])
+        # ✅ 如果词典的 key 带有首尾空格、引号等情况，也尝试一次清理后匹配
+        clean_key = key.strip(" '\"\n\t")
+        if clean_key in self.data:
+            return self._to_result(clean_key, self.data[clean_key])
 
-        for k in self.data:
-            if k.endswith(key):
-                return self._to_result(k, self.data[k])
-
+        # 🚫 不再允许任何模糊匹配（结尾、前缀、包含等）
         return None
+
 
     def _to_result(self, key, entry):
         phonetic = entry.get("phonetic", "") or ""
@@ -558,7 +566,7 @@ class DictLookup:
 class AnkiMakerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Anki Maker Version 3.0")
+        self.root.title("Anki Maker Version 3.1")
         self.data = []
         self.clipboard_listening = False  # 监听状态
         self.last_clipboard_content = ""  # 上次剪贴板内容缓存
@@ -649,6 +657,7 @@ class AnkiMakerApp:
             ttk.Button(btn_frame, text="📂 导入词典(记得先把zip解压)", command=self.load_dict_file).grid(row=2, column=3, padx=6)
             ttk.Button(btn_frame, text="📄 批量导入 TXT", command=self.import_txt_file).grid(row=3, column=0, padx=6)
             ttk.Button(btn_frame, text="📄 从MD/PDF/WORD/TXT提取单词", command=self.select_md_file).grid(row=3, column=1, padx=6)
+            ttk.Button(btn_frame, text="🔍 删除重复词条", command=self.remove_duplicates).grid(row=3, column=3, padx=6)
 
         # 主按钮先创建
         ttk.Button(btn_frame, text="➕ 添加词条", command=self.add_word).grid(row=0, column=0, padx=6)
@@ -755,21 +764,41 @@ class AnkiMakerApp:
             self._tree_insert(item)
 
 
+
     def autofill_from_dict(self):
-        """从词典自动填充单词的音标、词性和释义"""
+        """从词典自动填充单词的音标、词性和释义（仅在完全匹配时生效）"""
         word = self.word_entry.get().strip()
         if not word:
             self.status("请先输入单词")
-            return
+            return False
 
-        # 显示加载状态
-        self.status(f"正在查询 {word} 的信息...")
-        
-        # 从词典查询单词
-        result = self.dict_lookup.lookup(word)
-        if not result:
-            self.status(f"未在词典中找到 {word} 的信息")
-            return
+        key = word.lower()
+
+        # ✅ 严格匹配：只有完全匹配才触发补齐
+        if key not in self.dict_lookup.data:
+            return False  # ← 关键：明确返回 False 表示未找到
+
+        entry = self.dict_lookup.data[key]
+        result = self.dict_lookup._to_result(key, entry)
+
+        self.phonetic_entry.delete(0, tk.END)
+        self.phonetic_entry.insert(0, result.get("phonetic", ""))
+
+        self.pos_entry.delete(0, tk.END)
+        self.pos_entry.insert(0, result.get("pos", ""))
+
+        self.definition_text.delete("1.0", tk.END)
+        self.definition_text.insert("1.0", "\n".join(result.get("translations", [])))
+
+        self.example_text.focus_set()
+        self.status(f"已补齐 {word}")
+        return True  # ← 新增返回 True 表示补齐成功
+
+
+
+
+
+
 
         # 填充音标（修复变量名拼写错误：phon → phonetic）
         phonetic = result.get("phonetic", "")
@@ -838,6 +867,40 @@ class AnkiMakerApp:
                 
             # 短暂休眠减少CPU占用
             time.sleep(0.5)
+
+
+    def remove_duplicates(self):
+        """删除重复的词条（根据单词判断）"""
+        if not self.data:
+            messagebox.showinfo("提示", "没有可检查的词条")
+            return
+            
+        # 记录已出现的单词和它们的索引
+        seen_words = {}
+        duplicate_indices = []
+        
+        for index, item in enumerate(self.data):
+            word = item["word"].lower()  # 不区分大小写判断重复
+            if word in seen_words:
+                duplicate_indices.append(index)
+            else:
+                seen_words[word] = index
+        
+        if not duplicate_indices:
+            messagebox.showinfo("提示", "未发现重复词条")
+            return
+        
+        # 显示将要删除的重复词条数量
+        if messagebox.askyesno("确认删除", 
+                            f"共发现{len(duplicate_indices)}个重复词条，是否删除？"):
+            # 从后往前删除，避免索引错乱
+            for idx in sorted(duplicate_indices, reverse=True):
+                del self.data[idx]
+            
+            # 刷新列表显示
+            self.refresh_treeview()
+            self.status(f"已删除{len(duplicate_indices)}个重复词条，剩余{len(self.data)}个词条")
+
 
     # 添加辅助方法
     def _is_single_english_word(self, text):
@@ -955,11 +1018,12 @@ class AnkiMakerApp:
         file_path = filedialog.askopenfilename(
             title="选择文件提取生词",
             filetypes=[
-                ("所有支持的文件", "*.txt *.pdf *.docx *.md"),
+                ("所有支持的文件", "*.txt *.pdf *.docx *.md *.str"),
                 ("文本文件", "*.txt"),
                 ("PDF文件", "*.pdf"),
                 ("Word文件", "*.docx"),
                 ("Markdown文件", "*.md"),
+                ("字幕文件", "*.str"),
                 ("所有文件", "*.*")
             ]
         )
@@ -1053,8 +1117,6 @@ class AnkiMakerApp:
         
         ttk.Button(btn_frame, text="全部添加", command=add_all).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
-
-
 
     def _tree_insert(self, item):
         definition = item.get("definition", "").replace("\n", " | ")
@@ -1211,7 +1273,6 @@ class AnkiMakerApp:
 
         self.status(f"已删除 {len(indices_to_delete)} 条词条。剩余 {len(self.data)} 条。")
 
-
     # ---- 新增的清空方法 ----
     def clear_all_items(self):
         if not self.data:
@@ -1221,7 +1282,6 @@ class AnkiMakerApp:
             self.tree.delete(*self.tree.get_children())
             self.status("已清空所有词条")
             self.save_draft()  # 清空后立即保存
-
 
     # ---------------- Search ----------------
     def filter_tree(self, event=None):
@@ -1266,25 +1326,29 @@ class AnkiMakerApp:
         open_folder(os.path.abspath(EXPORT_FOLDER))
         self.status(f"已导出 JSON：{os.path.basename(path)}")
 
-
-
     def export_apkg(self):
         if not self.data:
             messagebox.showwarning("警告", "没有单词可导出！")
             return
 
-        ensure_export_folder()
-        deck = genanki.Deck(1984567890, "My Vocabulary")
+        # 🟢 让用户输入卡组名（Anki 标签 / deck name）
+        deck_name = simpledialog.askstring("输入卡组名称", "请输入要导出的 Anki 卡组名称：")
+        if not deck_name:  # 用户点取消或不输入
+            messagebox.showinfo("提示", "已取消导出。")
+            return
 
-        for it in self.data:  # ✅ 这里用 self.data 而不是 self.words
+        ensure_export_folder()
+        deck = genanki.Deck(1984567890, deck_name)  # ✅ 使用输入的名称
+
+        for it in self.data:
             note = genanki.Note(
-                model=vocab_model,  # 你自己定义的 model
+                model=vocab_model,
                 fields=[
                     it['word'],
-                    it.get('phonetic',''),
-                    it.get('pos',''),
-                    it.get('definition',''),
-                    it.get('example','')
+                    it.get('phonetic', ''),
+                    it.get('pos', ''),
+                    it.get('definition', ''),
+                    it.get('example', '')
                 ]
             )
             deck.add_note(note)
@@ -1296,10 +1360,9 @@ class AnkiMakerApp:
             genanki.Package(deck).write_to_file(file_path)
             self.status(f"已导出 APKG: {file_path}")
             open_folder(os.path.abspath(EXPORT_FOLDER))
-            messagebox.showinfo("成功", f"卡组已保存到：\n{file_path}")
+            messagebox.showinfo("成功", f"卡组 “{deck_name}” 已保存到：\n{file_path}")
         except Exception as e:
             messagebox.showerror("错误", f"导出失败：{e}")
-
 
     def export_md(self):
         if not self.data:
@@ -1353,7 +1416,6 @@ class AnkiMakerApp:
         self.clipboard_listening = True
         self.last_clipboard_content = ""
         self._poll_clipboard()
-
 
     def import_txt_file(self):
         """导入TXT文件，每行一个单词（优化版：批量处理，不显示中间过程）"""
@@ -1485,12 +1547,6 @@ class AnkiMakerApp:
         self.root.after(0, lambda: messagebox.showinfo("完成", f"已导入 {added} 个单词并生成卡片"))
         self.root.after(0, lambda: self.status(f"已从 TXT 导入 {added} 个单词"))
 
-
-
-
-
-
-
     def _poll_clipboard(self):
         if not self.clipboard_listening:
             return
@@ -1606,7 +1662,6 @@ class AnkiMakerApp:
             command=batch_import_and_close  # 使用新的回调函数
         ).pack()
 
-
     def batch_add_from_md(self, words):
         """将提取的单词批量添加到 Anki 列表（自动补全信息）"""
         for word in words:
@@ -1633,8 +1688,6 @@ class AnkiMakerApp:
         # 简化提示信息，避免重复弹窗
         self.status(f"已导入 {len(words)} 个单词（空值已过滤）")
 
-
-
     def import_json_draft(self):
         p = filedialog.askopenfilename(title="选择 JSON 草稿", filetypes=[("JSON", "*.json"), ("All files", "*.*")])
         if p:
@@ -1658,7 +1711,6 @@ class AnkiMakerApp:
         t = threading.Thread(target=self._autosave_loop, daemon=True)
         t.start()
 
-
     # ---------------- Search ----------------
     def filter_tree(self, event=None):
         q = self.search_var.get().strip().lower()
@@ -1673,20 +1725,17 @@ class AnkiMakerApp:
         tutorial_window = TutorialWindow(self.root)
         self.root.wait_window(tutorial_window)
 
-
     # ---------------- Close ----------------
     def on_close(self):
         self.autosave_running = False
         self.save_draft()
         self.root.destroy()
 
-
 # ---------------- Main ----------------
 def main():
     root = tk.Tk()
     app = AnkiMakerApp(root)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
